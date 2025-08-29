@@ -10,7 +10,8 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
-  projects: write
+  # projects 권한은 따로 없음, 대신 전체 권한 부여
+  id-token: write
 
 jobs:
   sync:
