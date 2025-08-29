@@ -1,0 +1,79 @@
+name: Sync to Central Project
+
+on:
+  issues:
+    types: [opened, labeled, unlabeled, closed, reopened]
+  pull_request:
+    types: [opened, labeled, unlabeled, closed, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  projects: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          OWNER: ttogle918              # 본인 GitHub ID or Org 이름
+          PROJECT_NUMBER: 4             # 만든 Project 번호
+          STATUS_TODO: "Todo"
+          STATUS_DOING: "In Progress"
+          STATUS_DONE: "Done"
+        with:
+          script: |
+            const owner = process.env.OWNER;
+            const number = Number(process.env.PROJECT_NUMBER);
+            const isIssue = !!context.payload.issue;
+            const nodeId = isIssue ? context.payload.issue.node_id : context.payload.pull_request.node_id;
+
+            // Project 정보 가져오기
+            const data = await github.graphql(`
+              query($owner:String!, $number:Int!){
+                organization(login:$owner){ projectV2(number:$number){ id fields(first:50){nodes{... on ProjectV2FieldCommon {id name}}}}}
+                user(login:$owner){ projectV2(number:$number){ id fields(first:50){nodes{... on ProjectV2FieldCommon {id name}}}}}
+              }`,
+              { owner, number }
+            );
+            const p = (data.organization?.projectV2) ?? (data.user?.projectV2);
+            if(!p) core.setFailed('Project not found');
+
+            // 아이템 추가
+            const add = await github.graphql(`
+              mutation($projectId:ID!, $contentId:ID!){
+                addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){ item { id } }
+              }`, { projectId: p.id, contentId: nodeId }
+            ).catch(()=>null);
+            const itemId = add?.addProjectV2ItemById?.item?.id ?? nodeId;
+
+            // Status 필드 옵션 찾기
+            const status = p.fields.nodes.find(f=>f.name==="Status");
+            const fQuery = await github.graphql(`
+              query($pid:ID!, $fid:ID!){
+                node(id:$pid){ ... on ProjectV2 { field(id:$fid){ ... on ProjectV2SingleSelectField { options { id name } } } } }
+              }`, { pid: p.id, fid: status.id }
+            );
+            const opts = fQuery.node.field.options;
+
+            // 상태 계산
+            const labels = (isIssue ? context.payload.issue.labels : context.payload.pull_request.labels) || [];
+            const closed = (isIssue ? context.payload.issue.state : context.payload.pull_request.state) === 'closed';
+            let target = process.env.STATUS_TODO;
+            if (closed) target = process.env.STATUS_DONE;
+            else if (labels.some(l=>String(l.name).toLowerCase()==='doing')) target = process.env.STATUS_DOING;
+
+            const opt = opts.find(o=>o.name===target);
+            if(!opt) core.setFailed(`Status option ${target} not found`);
+
+            // 상태 업데이트
+            await github.graphql(`
+              mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $opt:String!){
+                updateProjectV2ItemFieldValue(input:{
+                  projectId:$projectId, itemId:$itemId, fieldId:$fieldId,
+                  value:{ singleSelectOptionId:$opt }
+                }){ clientMutationId }
+              }`, { projectId: p.id, itemId: itemId, fieldId: status.id, opt: opt.id }
+            );
